@@ -1,92 +1,99 @@
 
-import { GoogleGenAI } from '@google/genai';
-import { AI_TIMEOUT_MS, AI_RETRIES } from '../config/adaptiveConfig.js';
+import { AI_TIMEOUT_MS } from '../config/adaptiveConfig.js';
 
-const apiKey = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_MODEL;
-const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL;
+const API_KEY = process.env.GROQ_API_KEY;
+const MODEL = process.env.GROQ_MODEL;
 
-if (!apiKey) throw new Error('GEMINI_API_KEY is missing in server/.env');
-if (!MODEL) throw new Error('GEMINI_MODEL is missing in server/.env');
+if (!API_KEY) throw new Error('GROQ_API_KEY is missing in server/.env');
+if (!MODEL) throw new Error('GROQ_MODEL is missing in server/.env');
 
-const ai = new GoogleGenAI({ apiKey });
 const TIMEOUT = AI_TIMEOUT_MS || 30000;
-const RETRIES = AI_RETRIES ?? 2;
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function toMessages(contents) {
+  if (typeof contents === 'string') {
+    return [{ role: 'user', content: contents }];
+  }
 
-function isTemporaryError(error) {
-  const message = String(error?.message || '').toLowerCase();
-  const status = Number(error?.status || error?.code);
+  if (!Array.isArray(contents)) {
+    contents = [contents];
+  }
 
-  return [429, 500, 502, 503, 504].includes(status) ||
-    ['unavailable', 'high demand', 'resource_exhausted', 'timeout', 'network']
-      .some(term => message.includes(term));
+  return contents.map(item => {
+    const role = item.role === 'model' ? 'assistant' :
+      item.role === 'system' ? 'system' : 'user';
+
+    const content = typeof item === 'string'
+      ? item
+      : item.parts?.map(part => part.text || '').join('\n') ||
+      item.content || '';
+
+    return { role, content };
+  });
 }
 
-async function callWithTimeout(fn) {
-  let timer;
+async function callGroq(contents, generationConfig = {}, schema = null) {
+  const messages = toMessages(contents);
+
+  if (schema) {
+    messages.push({
+      role: 'user',
+      content:
+        'Return valid JSON matching this schema. Do not include markdown:\n' +
+        JSON.stringify(schema)
+    });
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT);
+
   try {
-    return await Promise.race([
-      fn(),
-      new Promise((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error('Gemini request timed out')),
-          TIMEOUT
-        );
-      })
-    ]);
+    const response = await fetch(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: MODEL,
+          messages,
+          temperature: generationConfig.temperature ?? 0.2,
+          max_tokens: 4096,
+          ...(schema ? { response_format: { type: 'json_object' } } : {})
+        }),
+        signal: controller.signal
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      const error = new Error(
+        data.error?.message || `Groq API error: ${response.status}`
+      );
+      error.status = response.status;
+      throw error;
+    }
+
+    return data.choices?.[0]?.message?.content || '';
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('Groq request timed out. Please try again.');
+    }
+    console.error('Groq API error:', error.message);
+    throw error;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function requestWithRetry(model, contents, generationConfig) {
-  let lastError;
-
-  for (let attempt = 0; attempt <= RETRIES; attempt++) {
-    try {
-      return await callWithTimeout(() =>
-        ai.models.generateContent({ model, contents, generationConfig })
-      );
-    } catch (error) {
-      lastError = error;
-      if (!isTemporaryError(error) || attempt === RETRIES) throw error;
-      await sleep(Math.min(1000 * (2 ** attempt), 8000));
-    }
-  }
-
-  throw lastError;
-}
-
-async function generate(contents, generationConfig) {
-  try {
-    return await requestWithRetry(MODEL, contents, generationConfig);
-  } catch (error) {
-    if (FALLBACK_MODEL && FALLBACK_MODEL !== MODEL && isTemporaryError(error)) {
-      console.warn('Trying fallback Gemini model...');
-      return requestWithRetry(FALLBACK_MODEL, contents, generationConfig);
-    }
-    throw error;
-  }
-}
-
 export async function generateContent(contents, generationConfig = {}) {
-  const response = await generate(contents, generationConfig);
-  return response.text;
+  return await callGroq(contents, generationConfig);
 }
 
-export async function generateJSON(contents, schema, retries = RETRIES) {
-  const response = await generate(contents, {
-    temperature: 0.2,
-    responseMimeType: 'application/json',
-    responseSchema: schema
-  });
-
-  const rawText = response.text?.trim() || '';
-
-  console.log('GEMINI RAW RESPONSE:', rawText);
-  console.log('GEMINI FINISH REASON:', response.candidates?.[0]?.finishReason);
+export async function generateJSON(contents, schema, retries = 2) {
+  const rawText = await callGroq(contents, { temperature: 0.2 }, schema);
 
   const cleanedText = rawText
     .replace(/^```(?:json)?\s*/i, '')
@@ -97,6 +104,7 @@ export async function generateJSON(contents, schema, retries = RETRIES) {
     return JSON.parse(cleanedText);
   } catch (error) {
     console.error('JSON PARSE ERROR:', error.message);
-    throw new Error('Gemini returned invalid JSON. Please retry.');
+    console.error('Groq response:', rawText);
+    throw new Error('Groq returned invalid JSON. Please retry.');
   }
 }
